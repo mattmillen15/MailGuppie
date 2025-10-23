@@ -1,5 +1,5 @@
 # MailGuppie
-Mailjet API tool for email verification and forced authentication. 
+Mailgun API tool for email verification and forced authentication. 
 
 ```python
 python MailGuppie.py                          
