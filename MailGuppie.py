@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 """
-MailGuppie - Mailjet API Email Sender
+MailGuppie - Mailgun API Email Sender
+Sends forced authentication emails to a list of targets using the Mailgun API
 """
 
 import argparse
 import requests
 import hashlib
 import re
+import time
+import csv
+import io
+import zipfile
+import random
+import string
+import json
 import sys
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,17 +35,14 @@ def extract_domain(email):
     return email.split('@')[1] if '@' in email else None
 
 
-def load_api_credentials(key_path):
-    """Load API credentials from config file"""
-    credentials = {}
+def load_api_key(key_path):
+    """Load API key from config file"""
     with open(key_path, 'r') as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith('#'):
-                if ':' in line:
-                    key, value = line.split(':', 1)
-                    credentials[key.strip()] = value.strip()
-    return credentials
+                return line
+    return None
 
 
 def parse_template(template_path):
@@ -82,8 +87,8 @@ def replace_template_variables(html, variables, target_email, hash_value):
     return result
 
 
-def send_email(target, api_key, api_secret, sender_email, sender_name, subject, html_template, variables):
-    """Send a single email via Mailjet API"""
+def send_email(target, domain, api_key, sender_email, sender_name, subject, html_template, variables):
+    """Send a single email via Mailgun API"""
     try:
         # Generate hash for this target
         hash_value = generate_sha3_hash(target)
@@ -91,33 +96,19 @@ def send_email(target, api_key, api_secret, sender_email, sender_name, subject, 
         # Replace template variables
         html_body = replace_template_variables(html_template, variables, target, hash_value)
         
-        # Mailjet API endpoint
-        url = "https://api.mailjet.com/v3.1/send"
+        # Format sender with name
+        from_field = f"{sender_name} <{sender_email}>"
         
-        # Mailjet uses JSON format
-        data = {
-            "Messages": [
-                {
-                    "From": {
-                        "Email": sender_email,
-                        "Name": sender_name
-                    },
-                    "To": [
-                        {
-                            "Email": target
-                        }
-                    ],
-                    "Subject": subject,
-                    "HTMLPart": html_body
-                }
-            ]
-        }
-        
-        # Send via Mailjet API (uses basic auth with API key and secret)
+        # Send via Mailgun API
         response = requests.post(
-            url,
-            auth=(api_key, api_secret),
-            json=data,
+            f"https://api.mailgun.net/v3/{domain}/messages",
+            auth=("api", api_key),
+            data={
+                "from": from_field,
+                "to": target,
+                "subject": subject,
+                "html": html_body
+            },
             timeout=10
         )
         
@@ -132,6 +123,109 @@ def send_email(target, api_key, api_secret, sender_email, sender_name, subject, 
     except Exception as e:
         print(f"[-] Error sending to {target}: {str(e)}")
         return False, target
+
+
+def submit_bulk_validation(emails_list, list_name, api_key):
+    """Submit emails for bulk validation"""
+    url = f"https://api.mailgun.net/v4/address/validate/bulk/{list_name}"
+    csv_buffer = io.StringIO()
+    writer = csv.writer(csv_buffer)
+    writer.writerow(['email'])
+    writer.writerows([[email] for email in emails_list])
+    csv_buffer.seek(0)
+    files = {'file': ('emails.csv', csv_buffer, 'text/csv')}
+    response = requests.post(url, auth=("api", api_key), files=files, timeout=30)
+    return response
+
+
+def get_bulk_status(list_name, api_key):
+    """Check status of bulk validation"""
+    url = f"https://api.mailgun.net/v4/address/validate/bulk/{list_name}"
+    response = requests.get(url, auth=("api", api_key), timeout=30)
+    return response
+
+
+def download_results(download_url):
+    """Download and parse validation results"""
+    response = requests.get(download_url, timeout=30)
+    if response.status_code == 200:
+        with zipfile.ZipFile(io.BytesIO(response.content)) as z:
+            file_list = z.namelist()
+            for file in file_list:
+                if file.endswith('.json'):
+                    with z.open(file) as f:
+                        results = json.load(f)
+                    return results, 'json'
+                elif file.endswith('.csv'):
+                    with z.open(file) as f:
+                        csv_content = f.read().decode('utf-8')
+                        csv_reader = csv.DictReader(io.StringIO(csv_content))
+                        results = list(csv_reader)
+                    return results, 'csv'
+    return None, None
+
+
+def validate_emails(emails_list, api_key):
+    """Validate email list using Mailgun bulk validation"""
+    print("[*] Validating emails, this may take a few moments...")
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    random_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    list_name = f"validation_{timestamp}_{random_str}"
+    
+    submit_resp = submit_bulk_validation(emails_list, list_name, api_key)
+    if submit_resp.status_code != 202:
+        print(f"[-] Error uploading file: {submit_resp.status_code}")
+        return None
+    
+    start_time = time.time()
+    timeout = 300
+    results = None
+    file_type = None
+    
+    while True:
+        time.sleep(5)
+        status_resp = get_bulk_status(list_name, api_key)
+        if status_resp.status_code == 200:
+            data = status_resp.json()
+            status = data.get('status', 'unknown').lower()
+            download_url = data.get('download_url', {}).get('csv') or data.get('download_url', {}).get('json')
+            if download_url:
+                results, file_type = download_results(download_url)
+                if results:
+                    break
+                else:
+                    print("[-] Failed to process results.")
+                    return None
+            elif status == 'failed':
+                print(f"[-] Job failed: {data.get('error', 'Unknown error')}")
+                return None
+        else:
+            print(f"[-] Error checking status: {status_resp.status_code}")
+            return None
+        if time.time() - start_time > timeout:
+            print("[-] Job timed out after 5 minutes. Check Mailgun dashboard.")
+            return None
+    
+    # Process results
+    valid_emails = []
+    
+    for result in results:
+        email = result.get('address') or result.get('email', '')
+        if not email:
+            continue
+        val_result = result
+        if file_type == 'csv':
+            result_value = val_result.get('result', val_result.get('Result', '')).lower()
+        else:
+            result_value = val_result.get('result', '').lower()
+        
+        if result_value == 'deliverable':
+            risk = val_result.get('risk', 'low').lower()
+            if risk == 'low':
+                valid_emails.append(email)
+    
+    return valid_emails
 
 
 def main():
@@ -168,24 +262,15 @@ def main():
     
     print(banner)
     
-    # Load API credentials from config/key.conf
+    # Load API key from config/key.conf
     key_path = Path('config/key.conf')
     if not key_path.exists():
         print(f"[-] Error: API key file not found at {key_path}")
         return
     
-    credentials = load_api_credentials(key_path)
-    if not credentials:
-        print(f"[-] Error: Could not load API credentials from {key_path}")
-        return
-    
-    # Get Mailjet credentials
-    api_key = credentials.get('API_KEY')
-    api_secret = credentials.get('API_SECRET')
-    if not api_key or not api_secret:
-        print("[-] Error: API_KEY and API_SECRET required in config/key.conf")
-        print("    Format: API_KEY:your_key")
-        print("            API_SECRET:your_secret")
+    api_key = load_api_key(key_path)
+    if not api_key:
+        print(f"[-] Error: Could not load API key from {key_path}")
         return
     
     # Load template from config file
@@ -209,6 +294,12 @@ def main():
         print("[-] Error: SENDER not specified in template")
         return
     
+    # Extract domain from sender email
+    domain = extract_domain(sender_email)
+    if not domain:
+        print("[-] Error: Invalid sender email address in template")
+        return
+    
     print(f"[*] Email sender: {sender_name} <{sender_email}>")
     print(f"[*] Email subject: {subject}")
     
@@ -217,6 +308,30 @@ def main():
         targets = [line.strip() for line in f if line.strip()]
     
     print(f"[*] Loaded {len(targets)} targets")
+    
+    # Ask user if they want to validate emails
+    validate_choice = input("[?] Would you like to first validate the target email list using the Mailgun Bulk Email Validation Tool? (y/n): ").strip().lower()
+    
+    if validate_choice == 'y':
+        validated_targets = validate_emails(targets, api_key)
+        if validated_targets is None:
+            print("[-] Validation failed. Exiting.")
+            return
+        if len(validated_targets) == 0:
+            print("[-] No valid low-risk emails found. Exiting.")
+            return
+        
+        # Ask for confirmation before sending
+        proceed = input(f"[?] {len(validated_targets)} valid low-risk emails identified. Proceed with sending? (y/n): ").strip().lower()
+        if proceed != 'y':
+            print("[*] Send cancelled by user.")
+            return
+            
+        targets = validated_targets
+        print(f"[*] Sending to {len(targets)} validated targets...")
+    else:
+        print("[*] Skipping validation...")
+    
     print("[*] Starting send...")
     
     # Send emails with thread pool
@@ -228,8 +343,8 @@ def main():
             executor.submit(
                 send_email,
                 target,
+                domain,
                 api_key,
-                api_secret,
                 sender_email,
                 sender_name,
                 subject,
