@@ -92,14 +92,24 @@ FAIL    other@corp.com     def456hash    2026-08-02 14:30:05    [error]
 
 Pass `--resume` on subsequent runs to skip already-sent targets.
 
-## Batch Template Runner
+## Multi-Domain Send
 
-`send_search_tests.py` sends every `.conf` in a directory sequentially:
+`send_all_domains.py` sends a template from every configured engagement domain in sequence.
+The template `# SENDER:` must use `noreply@<domain.com>` — the wrapper substitutes the
+real domain per send.
 
 ```bash
-python3 send_search_tests.py -t target@corp.com -r 10.0.1.100 -d config/search-uri-tests
-python3 send_search_tests.py -t target@corp.com -r 10.0.1.100 -d config/search-uri-tests-v2
+# Send to a single address from all domains
+python3 send_all_domains.py -t target@corp.com -r 10.0.1.100
+
+# Send to a targets file from all domains
+python3 send_all_domains.py -t targets.txt -r 10.0.1.100
+
+# Preview without sending
+python3 send_all_domains.py -t target@corp.com -r 10.0.1.100 --dry-run
 ```
+
+The domain list is configured in `DOMAINS` at the top of `send_all_domains.py`.
 
 ## M365 Tenant Setup (per domain)
 
