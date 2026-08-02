@@ -1,0 +1,7 @@
+config/smtp.conf
+config/key.conf
+send.log
+/tmp/m365_token
+/tmp/dkim_results.json
+*.pyc
+__pycache__/

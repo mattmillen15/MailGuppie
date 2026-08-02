@@ -1,0 +1,22 @@
+# M365 SMTP relay credentials
+# Copy to config/smtp.conf and fill in your values.
+#
+# M365 (Office 365):
+#   HOST: smtp.office365.com
+#   PORT: 587
+#   USER: sender@yourdomain.com   ← licensed M365 account on your verified custom domain
+#   PASS: your_password
+#
+# SMTP AUTH must be enabled for the mailbox in M365 Admin Center:
+#   Users > Active users > <user> > Mail > Manage email apps > Authenticated SMTP (checked)
+#
+# Google Workspace (fallback):
+#   HOST: smtp.gmail.com
+#   PORT: 587
+#   USER: sender@yourdomain.com
+#   PASS: your_app_password       ← use a Google App Password, not your account password
+
+HOST: smtp.office365.com
+PORT: 587
+USER: sender@yourdomain.com
+PASS: your_password

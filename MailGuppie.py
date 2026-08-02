@@ -1,251 +1,309 @@
 #!/usr/bin/env python3
 """
-MailGuppie - Mailjet API Email Sender
+MailGuppie - M365 SMTP Email Sender
 """
 
 import argparse
-import requests
 import hashlib
 import re
+import smtplib
+import ssl
 import sys
+import time
+import random
+from datetime import datetime, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.utils import formataddr, make_msgid
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
 
 
-def generate_sha3_hash(email):
-    """Generate SHA3-256 hash and return middle 20 characters"""
-    hasher = hashlib.sha3_256()
-    hasher.update(email.encode('utf-8'))
-    hash_hex = hasher.hexdigest()
-    # Extract 20 characters from middle (chars 22-42)
-    return hash_hex[22:42]
-
-
-def extract_domain(email):
-    """Extract domain from email address"""
-    return email.split('@')[1] if '@' in email else None
-
-
-def load_api_credentials(key_path):
-    """Load API credentials from config file"""
-    credentials = {}
-    with open(key_path, 'r') as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith('#'):
-                if ':' in line:
-                    key, value = line.split(':', 1)
-                    credentials[key.strip()] = value.strip()
-    return credentials
-
-
-def parse_template(template_path):
-    """Parse the email template and extract variables"""
-    with open(template_path, 'r') as f:
-        content = f.read()
-    
-    # Extract variables section (lines starting with # at the top)
-    lines = content.split('\n')
-    variables = {}
-    template_start = 0
-    
-    for i, line in enumerate(lines):
-        if line.strip().startswith('#'):
-            # Parse variable: # VAR_NAME: value
-            match = re.match(r'#\s*(\w+):\s*(.+)', line)
-            if match:
-                var_name, var_value = match.groups()
-                variables[var_name.strip()] = var_value.strip()
-        elif line.strip() and not line.strip().startswith('#'):
-            template_start = i
-            break
-    
-    # Get template content (everything after variables)
-    template_html = '\n'.join(lines[template_start:])
-    
-    return variables, template_html
-
-
-def replace_template_variables(html, variables, target_email, hash_value):
-    """Replace all template variables in the HTML"""
-    replacements = {
-        '<SHA3_HASH>': hash_value,
-        '<TARGET_EMAIL>': target_email,
-        **{f'<{k}>': v for k, v in variables.items()}
-    }
-    
-    result = html
-    for placeholder, value in replacements.items():
-        result = result.replace(placeholder, value)
-    
-    return result
-
-
-def send_email(target, api_key, api_secret, sender_email, sender_name, subject, html_template, variables):
-    """Send a single email via Mailjet API"""
-    try:
-        # Generate hash for this target
-        hash_value = generate_sha3_hash(target)
-        
-        # Replace template variables
-        html_body = replace_template_variables(html_template, variables, target, hash_value)
-        
-        # Mailjet API endpoint
-        url = "https://api.mailjet.com/v3.1/send"
-        
-        # Mailjet uses JSON format
-        data = {
-            "Messages": [
-                {
-                    "From": {
-                        "Email": sender_email,
-                        "Name": sender_name
-                    },
-                    "To": [
-                        {
-                            "Email": target
-                        }
-                    ],
-                    "Subject": subject,
-                    "HTMLPart": html_body
-                }
-            ]
-        }
-        
-        # Send via Mailjet API (uses basic auth with API key and secret)
-        response = requests.post(
-            url,
-            auth=(api_key, api_secret),
-            json=data,
-            timeout=10
-        )
-        
-        if response.status_code == 200:
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[+] Target: {target}\tHash: {hash_value}\tTime: {timestamp}")
-            return True, target
-        else:
-            print(f"[-] Error sending to {target}: {response.status_code} - {response.text}")
-            return False, target
-            
-    except Exception as e:
-        print(f"[-] Error sending to {target}: {str(e)}")
-        return False, target
-
-
-def main():
-    banner = """
+BANNER = """
 ╔════════════════════════════════════════════════╗
 ║                  MailGuppie                    ║
 ╚════════════════════════════════════════════════╝
 
           ><((((º>   ><((((º>   ><((((º>
 """
-    
-    # Show help if no arguments provided
-    if len(sys.argv) == 1:
-        print(banner)
-        parser = argparse.ArgumentParser(
-            usage='%(prog)s -t <targets.txt> -r <responder-ip> [options]',
-            formatter_class=argparse.RawDescriptionHelpFormatter
-        )
-        parser.add_argument('-t', '--targets', required=True, help='Target email list file (.txt)', metavar='<targets.txt>')
-        parser.add_argument('-r', '--responder', required=True, help='Responder server IP/hostname', metavar='<responder-ip>')
-        parser.add_argument('-c', '--config', default='config/template.conf', help='Template config file (default: config/template.conf)', metavar='<template.conf>')
-        parser.print_help()
-        return
-    
+
+
+def generate_sha3_hash(email):
+    hasher = hashlib.sha3_256()
+    hasher.update(email.encode("utf-8"))
+    return hasher.hexdigest()[22:42]
+
+
+def load_config(path):
+    config = {}
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and ":" in line:
+                key, _, value = line.partition(":")
+                config[key.strip()] = value.strip()
+    return config
+
+
+def parse_template(path):
+    content = Path(path).read_text()
+    lines = content.split("\n")
+    variables = {}
+    body_start = 0
+
+    for i, line in enumerate(lines):
+        if line.strip().startswith("#"):
+            m = re.match(r"#\s*(\w+):\s*(.+)", line)
+            if m:
+                variables[m.group(1)] = m.group(2).strip()
+        elif line.strip():
+            body_start = i
+            break
+
+    return variables, "\n".join(lines[body_start:])
+
+
+def render(html_body, variables, target, hash_value):
+    replacements = {
+        "<SHA3_HASH>": hash_value,
+        "<TARGET_EMAIL>": target,
+        **{f"<{k}>": v for k, v in variables.items()},
+    }
+    for placeholder, value in replacements.items():
+        html_body = html_body.replace(placeholder, value)
+    return html_body
+
+
+def html_to_text(html_body):
+    text = re.sub(r"<[^>]+>", "", html_body)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def build_message(target, sender_email, sender_name, reply_to, subject, html_body, sender_domain):
+    msg = MIMEMultipart("alternative")
+    msg["From"] = formataddr((sender_name, sender_email)) if sender_name else sender_email
+    msg["To"] = target
+    msg["Subject"] = subject
+    msg["Message-ID"] = make_msgid(domain=sender_domain)
+    msg["Date"] = datetime.now(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S +0000")
+    if reply_to:
+        msg["Reply-To"] = reply_to
+
+    msg.attach(MIMEText(html_to_text(html_body), "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+    return msg
+
+
+class SMTPRelay:
+    def __init__(self, host, port, user, password):
+        self.host = host
+        self.port = int(port)
+        self.user = user
+        self.password = password
+        self._conn = None
+
+    def connect(self):
+        self._conn = smtplib.SMTP(self.host, self.port, timeout=30)
+        self._conn.ehlo()
+        self._conn.starttls(context=ssl.create_default_context())
+        self._conn.ehlo()
+        self._conn.login(self.user, self.password)
+
+    def send(self, msg, sender_email, target):
+        try:
+            self._conn.sendmail(sender_email, [target], msg.as_string())
+        except smtplib.SMTPServerDisconnected:
+            self.connect()
+            self._conn.sendmail(sender_email, [target], msg.as_string())
+
+    def quit(self):
+        if self._conn:
+            try:
+                self._conn.quit()
+            except Exception:
+                pass
+
+
+def load_sent(log_path):
+    sent = set()
+    if Path(log_path).exists():
+        with open(log_path, "r") as f:
+            for line in f:
+                parts = line.strip().split("\t")
+                if len(parts) >= 2 and parts[0] == "SENT":
+                    sent.add(parts[1])
+    return sent
+
+
+def write_log(log_path, status, target, hash_value, note=""):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(log_path, "a") as f:
+        f.write(f"{status}\t{target}\t{hash_value}\t{ts}\t{note}\n")
+
+
+def parse_delay(delay_str):
+    parts = delay_str.split("-")
+    try:
+        lo = float(parts[0])
+        hi = float(parts[1]) if len(parts) > 1 else lo
+        return lo, hi
+    except (ValueError, IndexError):
+        raise argparse.ArgumentTypeError(f"Invalid delay format '{delay_str}' — use seconds or min-max (e.g. 3-8)")
+
+
+def build_parser():
     parser = argparse.ArgumentParser(
-        usage='%(prog)s -t <targets.txt> -r <responder-ip> [options]',
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        usage="%(prog)s -t <targets.txt> -r <responder> [options]",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="M365 SMTP phishing relay for authorized red team engagements",
     )
-    parser.add_argument('-t', '--targets', required=True, help='Target email list file (.txt)', metavar='<targets.txt>')
-    parser.add_argument('-r', '--responder', required=True, help='Responder server IP/hostname', metavar='<responder-ip>')
-    parser.add_argument('-c', '--config', default='config/template.conf', help='Template config file (default: config/template.conf)', metavar='<template.conf>')
-    
+    parser.add_argument("-t", "--targets",  required=True, metavar="<targets.txt>",
+                        help="File containing one target email per line")
+    parser.add_argument("-r", "--responder", required=True, metavar="<responder>",
+                        help="Responder IP or hostname (substituted for <RESPONDER>)")
+    parser.add_argument("-c", "--config",   default="config/template.conf", metavar="<template.conf>",
+                        help="Email template file (default: config/template.conf)")
+    parser.add_argument("-s", "--smtp",     default="config/smtp.conf", metavar="<smtp.conf>",
+                        help="SMTP credentials file (default: config/smtp.conf)")
+    parser.add_argument("-l", "--log",      default="send.log", metavar="<log>",
+                        help="Append-only send log (default: send.log)")
+    parser.add_argument("--delay",          default="3-8", metavar="<min-max>",
+                        help="Seconds between sends, supports range (default: 3-8)")
+    parser.add_argument("--dry-run",        action="store_true",
+                        help="Render the first message and print it without sending")
+    parser.add_argument("--resume",         action="store_true",
+                        help="Skip targets already marked SENT in the log")
+    return parser
+
+
+def main():
+    print(BANNER)
+
+    parser = build_parser()
+    if len(sys.argv) == 1:
+        parser.print_help()
+        sys.exit(0)
+
     args = parser.parse_args()
-    
-    print(banner)
-    
-    # Load API credentials from config/key.conf
-    key_path = Path('config/key.conf')
-    if not key_path.exists():
-        print(f"[-] Error: API key file not found at {key_path}")
-        return
-    
-    credentials = load_api_credentials(key_path)
-    if not credentials:
-        print(f"[-] Error: Could not load API credentials from {key_path}")
-        return
-    
-    # Get Mailjet credentials
-    api_key = credentials.get('API_KEY')
-    api_secret = credentials.get('API_SECRET')
-    if not api_key or not api_secret:
-        print("[-] Error: API_KEY and API_SECRET required in config/key.conf")
-        print("    Format: API_KEY:your_key")
-        print("            API_SECRET:your_secret")
-        return
-    
-    # Load template from config file
+
+    try:
+        delay_min, delay_max = parse_delay(args.delay)
+    except argparse.ArgumentTypeError as e:
+        print(f"[-] {e}")
+        sys.exit(1)
+
+    # --- SMTP config ---
+    smtp_path = Path(args.smtp)
+    if not smtp_path.exists():
+        print(f"[-] SMTP config not found: {smtp_path}")
+        print("    Create config/smtp.conf — see config/smtp.conf.example")
+        sys.exit(1)
+
+    smtp_cfg = load_config(smtp_path)
+    for field in ("HOST", "PORT", "USER", "PASS"):
+        if field not in smtp_cfg:
+            print(f"[-] Missing '{field}' in {smtp_path}")
+            sys.exit(1)
+
+    # --- Template ---
     template_path = Path(args.config)
     if not template_path.exists():
-        print(f"[-] Error: Template not found at {template_path}")
-        return
-    
-    print(f"[*] Loading template: {template_path}")
+        print(f"[-] Template not found: {template_path}")
+        sys.exit(1)
+
     variables, html_template = parse_template(template_path)
-    
-    # Add responder from command line argument
-    variables['RESPONDER'] = args.responder
-    
-    # Get required variables from template
-    sender_email = variables.get('SENDER')
-    sender_name = variables.get('SENDER_NAME', '')
-    subject = variables.get('SUBJECT', 'No Subject')
-    
+    variables["RESPONDER"] = args.responder
+
+    sender_email = variables.get("SENDER", "").strip()
+    sender_name  = variables.get("SENDER_NAME", "").strip()
+    subject      = variables.get("SUBJECT", "No Subject").strip()
+    reply_to     = variables.get("REPLY_TO", "").strip()
+
     if not sender_email:
-        print("[-] Error: SENDER not specified in template")
-        return
-    
-    print(f"[*] Email sender: {sender_name} <{sender_email}>")
-    print(f"[*] Email subject: {subject}")
-    
-    # Read target list
-    with open(args.targets, 'r') as f:
-        targets = [line.strip() for line in f if line.strip()]
-    
-    print(f"[*] Loaded {len(targets)} targets")
-    print("[*] Starting send...")
-    
-    # Send emails with thread pool
-    success_count = 0
-    fail_count = 0
-    
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {
-            executor.submit(
-                send_email,
-                target,
-                api_key,
-                api_secret,
-                sender_email,
-                sender_name,
-                subject,
-                html_template,
-                variables
-            ): target for target in targets
-        }
-        
-        for future in as_completed(futures):
-            success, target = future.result()
-            if success:
-                success_count += 1
-            else:
-                fail_count += 1
-    
-    print(f"\n[*] Complete! Success: {success_count}, Failed: {fail_count}")
+        print("[-] SENDER not set in template")
+        sys.exit(1)
+
+    sender_domain = sender_email.split("@")[1] if "@" in sender_email else "localhost"
+
+    print(f"[*] Template  : {template_path}")
+    print(f"[*] From      : {sender_name} <{sender_email}>" if sender_name else f"[*] From      : {sender_email}")
+    if reply_to:
+        print(f"[*] Reply-To  : {reply_to}")
+    print(f"[*] Subject   : {subject}")
+    print(f"[*] Relay     : {smtp_cfg['HOST']}:{smtp_cfg['PORT']}  ({smtp_cfg['USER']})")
+
+    # --- Targets ---
+    with open(args.targets, "r") as f:
+        targets = [line.strip() for line in f if line.strip() and "@" in line]
+
+    if not targets:
+        print("[-] No valid targets found")
+        sys.exit(1)
+
+    print(f"[*] Targets   : {len(targets)}")
+
+    if args.resume:
+        sent = load_sent(args.log)
+        before = len(targets)
+        targets = [t for t in targets if t not in sent]
+        skipped = before - len(targets)
+        if skipped:
+            print(f"[*] Resume    : skipping {skipped} already sent")
+
+    if not targets:
+        print("[*] All targets already sent.")
+        sys.exit(0)
+
+    # --- Dry run ---
+    if args.dry_run:
+        t = targets[0]
+        h = generate_sha3_hash(t)
+        body = render(html_template, variables, t, h)
+        msg = build_message(t, sender_email, sender_name, reply_to, subject, body, sender_domain)
+        print(f"\n[DRY RUN] Message preview for: {t}\n")
+        print(msg.as_string())
+        print(f"\n[DRY RUN] No emails sent.  ({len(targets)} target(s) queued)")
+        sys.exit(0)
+
+    print(f"[*] Delay     : {delay_min}-{delay_max}s\n")
+
+    # --- Connect ---
+    relay = SMTPRelay(smtp_cfg["HOST"], smtp_cfg["PORT"], smtp_cfg["USER"], smtp_cfg["PASS"])
+    try:
+        relay.connect()
+        print(f"[*] Connected to {smtp_cfg['HOST']}\n")
+    except Exception as e:
+        print(f"[-] SMTP connection failed: {e}")
+        sys.exit(1)
+
+    success = 0
+    failed  = 0
+
+    try:
+        for i, target in enumerate(targets):
+            hash_value = generate_sha3_hash(target)
+            body = render(html_template, variables, target, hash_value)
+            msg  = build_message(target, sender_email, sender_name, reply_to, subject, body, sender_domain)
+
+            try:
+                relay.send(msg, sender_email, target)
+                ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(f"[+] {target}\t{hash_value}\t{ts}")
+                write_log(args.log, "SENT", target, hash_value)
+                success += 1
+            except Exception as e:
+                print(f"[-] FAILED {target}: {e}")
+                write_log(args.log, "FAIL", target, hash_value, str(e))
+                failed += 1
+
+            if i < len(targets) - 1:
+                time.sleep(random.uniform(delay_min, delay_max))
+
+    finally:
+        relay.quit()
+
+    print(f"\n[*] Done — Sent: {success}  Failed: {failed}  Log: {args.log}")
+    sys.exit(0 if failed == 0 else 1)
 
 
 if __name__ == "__main__":
