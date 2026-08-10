@@ -1,4 +1,3 @@
-config/key.conf
 send.log
 *.pyc
 __pycache__/
