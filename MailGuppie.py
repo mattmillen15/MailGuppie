@@ -60,15 +60,15 @@ def parse_template(path):
     return variables, "\n".join(lines[body_start:])
 
 
-def render(html_body, variables, target, hash_value):
+def render(text, variables, target, hash_value):
     replacements = {
         "<SHA3_HASH>":    hash_value,
         "<TARGET_EMAIL>": target,
         **{f"<{k}>": v for k, v in variables.items()},
     }
     for placeholder, value in replacements.items():
-        html_body = html_body.replace(placeholder, value)
-    return html_body
+        text = text.replace(placeholder, value)
+    return text
 
 
 def html_to_text(html_body):
@@ -141,20 +141,24 @@ def parse_delay(delay_str):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        usage="%(prog)s -s <sender@domain.com> -t <targets.txt> -r <responder> [options]",
+        usage="%(prog)s -s <sender> -t <targets.txt> [-m forced-auth -r <responder>] [-m phish -u <lure-url>]",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Cloudflare Email sender for authorized red team engagements",
     )
+    parser.add_argument("-m", "--mode",      choices=["forced-auth", "phish"], default="forced-auth",
+                        help="Mode: forced-auth (default) or phish")
     parser.add_argument("-s", "--sender",    required=True, metavar="<sender@domain.com>",
                         help="Sender address (must be on a verified Cloudflare domain)")
     parser.add_argument("-n", "--name",      default=None, metavar="<display name>",
                         help="Sender display name (default: local part of -s address)")
     parser.add_argument("-t", "--targets",   required=True, metavar="<targets.txt>",
                         help="File containing one target email per line")
-    parser.add_argument("-r", "--responder", required=True, metavar="<responder>",
-                        help="Responder IP or hostname (substituted for <RESPONDER>)")
-    parser.add_argument("-c", "--config",    default="config/template.conf", metavar="<template.conf>",
-                        help="Email template file (default: config/template.conf)")
+    parser.add_argument("-r", "--responder", default=None, metavar="<responder>",
+                        help="Responder IP/hostname (forced-auth mode)")
+    parser.add_argument("-u", "--url",       default=None, metavar="<lure-url>",
+                        help="Lure URL (phish mode)")
+    parser.add_argument("-c", "--config",    default=None, metavar="<template.conf>",
+                        help="Email template (default: per mode)")
     parser.add_argument("-l", "--log",       default="send.log", metavar="<log>",
                         help="Append-only send log (default: send.log)")
     parser.add_argument("--delay",           default=None, metavar="<min-max>",
@@ -175,6 +179,13 @@ def main():
         sys.exit(0)
 
     args = parser.parse_args()
+
+    if args.mode == "forced-auth" and not args.responder:
+        parser.error("forced-auth mode requires -r/--responder")
+    if args.mode == "phish" and not args.url:
+        parser.error("phish mode requires -u/--url")
+    if args.config is None:
+        args.config = "config/template.conf" if args.mode == "forced-auth" else "config/security-alert.conf"
 
     delay_min, delay_max = 0, 0
     if args.delay:
@@ -210,18 +221,26 @@ def main():
     variables, html_template = parse_template(template_path)
     sender_name = args.name or args.sender.split("@")[0]
 
-    variables["RESPONDER"]   = args.responder
+    if args.mode == "forced-auth":
+        variables["RESPONDER"] = args.responder
+    else:
+        variables["LURE_URL"] = args.url
     variables["SENDER"]      = args.sender
     variables["SENDER_NAME"] = sender_name
 
     subject  = variables.get("SUBJECT", "No Subject").strip()
     reply_to = variables.get("REPLY_TO", "").strip()
 
+    print(f"[*] Mode      : {args.mode}")
     print(f"[*] Template  : {template_path}")
     print(f"[*] From      : {sender_name} <{args.sender}>")
     if reply_to:
         print(f"[*] Reply-To  : {reply_to}")
     print(f"[*] Subject   : {subject}")
+    if args.mode == "forced-auth":
+        print(f"[*] Responder : {args.responder}")
+    else:
+        print(f"[*] Lure URL  : {args.url}")
     print(f"[*] Relay     : Cloudflare Email")
 
     # --- Targets ---
@@ -251,12 +270,13 @@ def main():
         t = targets[0]
         h = generate_sha3_hash(t)
         body = render(html_template, variables, t, h)
+        rendered_subject = render(subject, variables, t, h)
         print(f"\n[DRY RUN] Message preview for: {t}\n")
         print(f"From: {sender_name} <{args.sender}>")
         if reply_to:
             print(f"Reply-To: {reply_to}")
         print(f"To: {t}")
-        print(f"Subject: {subject}")
+        print(f"Subject: {rendered_subject}")
         print(f"\n{body}")
         print(f"\n[DRY RUN] No emails sent.  ({len(targets)} target(s) queued)")
         sys.exit(0)
@@ -273,9 +293,10 @@ def main():
     for i, target in enumerate(targets):
         hash_value = generate_sha3_hash(target)
         body = render(html_template, variables, target, hash_value)
+        rendered_subject = render(subject, variables, target, hash_value)
 
         try:
-            mailer.send(args.sender, sender_name, reply_to, target, subject, body)
+            mailer.send(args.sender, sender_name, reply_to, target, rendered_subject, body)
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(f"[+] {target}\t{hash_value}\t{ts}")
             write_log(args.log, "SENT", target, hash_value)
