@@ -185,7 +185,7 @@ def main():
     if args.mode == "phish" and not args.url:
         parser.error("phish mode requires -u/--url")
     if args.config is None:
-        args.config = "config/template.conf" if args.mode == "forced-auth" else "config/security-alert.conf"
+        args.config = "config/template.conf" if args.mode == "forced-auth" else "config/policy-update.conf"
 
     delay_min, delay_max = 0, 0
     if args.delay:

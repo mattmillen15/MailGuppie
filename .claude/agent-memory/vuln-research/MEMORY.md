@@ -1,0 +1,1 @@
+- [Forced Auth Research](project_forced-auth-research.md) — MailGuppie forced auth research: email deliverability vs NTLM hash capture via file:// URIs

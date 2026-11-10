@@ -54,8 +54,7 @@ python3 MailGuppie.py -m phish -s noreply@domain.com -n "Security Team" -t targe
 
 ### phish
 
-- `config/security-alert.conf` — unusual sign-in activity (default)
-- `config/invoice-due.conf` — invoice payment due
+- `config/policy-update.conf` — terms of service update (default)
 
 Edit template headers to set subject, reply-to, and custom variables.
 
